@@ -27,9 +27,11 @@ import (
 	"go.uber.org/zap"
 	api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	servicecontroller "k8s.io/cloud-provider/controllers/service"
 
 	"github.com/oracle/oci-cloud-controller-manager/pkg/metrics"
 	"github.com/oracle/oci-cloud-controller-manager/pkg/oci/client"
+	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/loadbalancer"
 )
 
@@ -276,18 +278,21 @@ func hasBackendSetChanged(logger *zap.SugaredLogger, actual client.GenericBacken
 	backendSetChanges = append(backendSetChanges, getSSLConfigurationChanges(actual.SslConfiguration, desired.SslConfiguration)...)
 	nameFormat := "%s:%d"
 
-	desiredSet := sets.NewString()
+	desiredDrain := make(map[string]*bool, len(desired.Backends))
 	for _, backend := range desired.Backends {
 		name := fmt.Sprintf(nameFormat, *backend.IpAddress, *backend.Port)
-		desiredSet.Insert(name)
+		desiredDrain[name] = backend.Drain
 	}
 
 	actualSet := sets.NewString()
 	var backendChanges []string
 	for _, backend := range actual.Backends {
 		name := fmt.Sprintf(nameFormat, *backend.IpAddress, *backend.Port)
-		if !desiredSet.Has(name) {
+		drain, ok := desiredDrain[name]
+		if !ok {
 			backendChanges = append(backendChanges, fmt.Sprintf(backendChangeFmtStr, "BackEndSet:Backend Remove", name))
+		} else if drain != nil && *drain != toBool(backend.Drain) {
+			backendChanges = append(backendChanges, fmt.Sprintf(changeFmtStr, "BackEndSet:Backend "+name+" Drain", toBool(backend.Drain), *drain))
 		}
 		actualSet.Insert(name)
 	}
@@ -308,6 +313,75 @@ func hasBackendSetChanged(logger *zap.SugaredLogger, actual client.GenericBacken
 		return true
 	}
 	return false
+}
+
+func isToBeDeletedByClusterAutoscaler(node *api.Node) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == servicecontroller.ToBeDeletedTaint {
+			return true
+		}
+	}
+	return false
+}
+
+// nodesByBackendIP indexes nodes by the addresses getBackends uses for them.
+func nodesByBackendIP(nodes []*api.Node) map[string]*api.Node {
+	byIP := make(map[string]*api.Node, len(nodes))
+	for _, node := range nodes {
+		ips := NodeInternalIP(node)
+		if ips.V6 == "" {
+			ips.V6 = NodeExternalIp(node).V6
+		}
+		for _, ip := range []string{ips.V4, ips.V6} {
+			if ip != "" {
+				byIP[ip] = node
+			}
+		}
+	}
+	return byIP
+}
+
+// drainScaleDownBackends also un-drains desired backends that are currently drained.
+func drainScaleDownBackends(logger *zap.SugaredLogger, actual, desired map[string]client.GenericBackendSetDetails, nodesByIP map[string]*api.Node) {
+	for name, desiredBackendSet := range desired {
+		actualBackendSet, ok := actual[name]
+		if !ok {
+			continue
+		}
+		actualByName := make(map[string]client.GenericBackend, len(actualBackendSet.Backends))
+		for _, backend := range actualBackendSet.Backends {
+			actualByName[fmt.Sprintf("%s:%d", *backend.IpAddress, *backend.Port)] = backend
+		}
+
+		desiredIPs := sets.NewString()
+		backends := make([]client.GenericBackend, 0, len(actualBackendSet.Backends))
+		for _, backend := range desiredBackendSet.Backends {
+			desiredIPs.Insert(*backend.IpAddress)
+			backendName := fmt.Sprintf("%s:%d", *backend.IpAddress, *backend.Port)
+			if actualBackend, ok := actualByName[backendName]; ok && toBool(actualBackend.Drain) {
+				backend.Drain = common.Bool(false)
+				logger.With("backendSetName", name, "backend", backendName).Info("Un-draining backend of node no longer being removed")
+			}
+			backends = append(backends, backend)
+		}
+
+		for _, backend := range actualBackendSet.Backends {
+			if desiredIPs.Has(*backend.IpAddress) {
+				continue
+			}
+			node, ok := nodesByIP[*backend.IpAddress]
+			if !ok || !isToBeDeletedByClusterAutoscaler(node) {
+				continue
+			}
+			if !toBool(backend.Drain) {
+				logger.With("backendSetName", name, "backend", fmt.Sprintf("%s:%d", *backend.IpAddress, *backend.Port), "nodeName", node.Name).Info("Draining backend of node being removed by the cluster autoscaler")
+			}
+			backend.Drain = common.Bool(true)
+			backends = append(backends, backend)
+		}
+		desiredBackendSet.Backends = backends
+		desired[name] = desiredBackendSet
+	}
 }
 
 func healthCheckerToDetails(hc *client.GenericHealthChecker) *client.GenericHealthChecker {

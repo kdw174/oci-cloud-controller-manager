@@ -43,6 +43,7 @@ spec:
 | `service.beta.kubernetes.io/oci-load-balancer-health-check-timeout`          | The maximum time, in milliseconds, to wait for a reply to a [health check][6]. A [health check][6] is successful only if a reply returns within this timeout period.                                                                                                             | `3000`                                           |                                                                                          |
 | `service.beta.kubernetes.io/oci-load-balancer-health-check-interval`         | The interval between [health checks][6] requests, in milliseconds.                                                                                                                                                                                                               | `10000`                                          |                                                                                          |
 | `service.beta.kubernetes.io/oci-load-balancer-connection-idle-timeout`       | The maximum idle time, in seconds, allowed between two successive receive or two successive send operations between the client and backend servers.                                                                                                                              | `300` for TCP listeners, `60` for HTTP listeners |                                                                                          |
+| `service.beta.kubernetes.io/oci-load-balancer-drain-backends-on-scale-down` | When `"true"`, the backend of a node tainted `ToBeDeletedByClusterAutoscaler` is set to drain (no new connections, existing connections continue) instead of being removed. See [Draining backends on scale-down](#draining-backends-on-scale-down). | `"false"` | |
 | `service.beta.kubernetes.io/oci-load-balancer-security-list-management-mode` | Specifies the [security list mode](##security-list-management-modes) (`"All"`, `"Frontend"`,`"None"`) to configure how security lists are managed by the CCM.                                                                                                                    | `"All"`                                          |                                                                                          |
 | `service.beta.kubernetes.io/oci-load-balancer-backend-protocol`              | Specifies protocol on which the listener accepts connection requests. To get a list of valid protocols, use the [`ListProtocols`][5] operation. Supported[listener protocols][13]                                                                                                | `"TCP"`                                          |                                                                                          |
 | `service.beta.kubernetes.io/oci-load-balancer-ssl-ports`                     | The ports to enable SSL termination on the corresponding load balancer listener                                                                                                                                                                                                  | `443`                                            |                                                                                          |
@@ -95,6 +96,7 @@ Note:
 | `oci-network-load-balancer.oraclecloud.com/health-check-timeout`           | The maximum time, in milliseconds, to wait for a reply to a health check. A health check is successful only if a reply returns within this timeout period.                                   | `3000`                                    |
 | `oci-network-load-balancer.oraclecloud.com/health-check-interval`          | The interval between health checks requests, in milliseconds.                                                                                                                                | `3000`                                    |
 | `oci-network-load-balancer.oraclecloud.com/backend-policy`                 | The network load balancer policy for the backend set. Valid values: "TWO_TUPLE", "THREE_TUPLE", or "FIVE_TUPLE"		                                                                            | `"FIVE_TUPLE"`                            |
+| `oci-network-load-balancer.oraclecloud.com/drain-backends-on-scale-down`   | When `"true"`, the backend of a node tainted `ToBeDeletedByClusterAutoscaler` is set to drain (no new connections, existing connections continue) instead of being removed. See [Draining backends on scale-down](#draining-backends-on-scale-down). | `"false"` |
 | `oci-network-load-balancer.oraclecloud.com/security-list-management-mode`  | Specifies the security list mode ("All", "Frontend","None") to configure how security lists are managed.		                                                                                   | `"None"`                                  |
 | `oci-network-load-balancer.oraclecloud.com/node-label-selector`            | Specifies which nodes to add as a backend to the OCI Network Load Balancer.		                                                                                                                | `"None"`                                  |
 | `oci-network-load-balancer.oraclecloud.com/is-preserve-source`             | Enable or disable the network load balancer to preserve source address of incoming traffic. Can be set only when externalTrafficPolicy is set to Local.	                                     | `"true" (if externalTrafficPolicy=Local)` |
@@ -106,6 +108,29 @@ Note:
 
 Note:
 - The only security list management mode allowed when backend protocol is UDP is "None"
+
+## Draining backends on scale-down
+
+With `oci-network-load-balancer.oraclecloud.com/drain-backends-on-scale-down` (NLB) or
+`service.beta.kubernetes.io/oci-load-balancer-drain-backends-on-scale-down` (LB) set to `"true"`, a backend
+whose node is no longer in the desired set, but whose Node still exists with the `ToBeDeletedByClusterAutoscaler`
+taint, is kept and set to drain. It keeps its existing identity (IP, port and, for NLB, the instance target).
+A desired backend that is drained, for example after an aborted scale-down, is un-drained.
+
+Neither adding the taint nor deleting the tainted Node makes the service controller sync the load balancer. The
+drain takes effect on the first sync of the Service after the taint is added, which is the sync that would
+otherwise remove the backend.
+The drained backend is removed on the next sync after its Node is deleted. On a quiet cluster that can take a
+while, and the drained backend shows as unhealthy in OCI in the meantime.
+
+Removing the annotation does not un-drain a backend that is already draining.
+
+Known limitations:
+- If every node eligible as a backend is tainted at once, the service controller passes an empty node list and
+  the existing network-partition check blocks the update. The backends stay in place, undrained, until the
+  nodes are gone.
+- If the Service's NodePort changes while a node is draining, the drained backend stays on the old port while its
+  security rule is moved to the new port.
 
 ## Network Load Balancer
 

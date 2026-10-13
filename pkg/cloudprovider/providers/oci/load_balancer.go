@@ -906,6 +906,10 @@ func (cp *CloudProvider) EnsureLoadBalancer(ctx context.Context, clusterName str
 		return nil, nil
 	}
 
+	if err := cp.drainScaleDownBackends(logger, lb, spec); err != nil {
+		return nil, err
+	}
+
 	if err := lbProvider.updateLoadBalancer(ctx, lb, spec); err != nil {
 		errorType = util.GetError(err)
 		lbMetricDimension = util.GetMetricDimensionForComponent(errorType, util.LoadBalancerType)
@@ -1554,6 +1558,10 @@ func (cp *CloudProvider) UpdateLoadBalancer(ctx context.Context, clusterName str
 		return err
 	}
 
+	if err := cp.drainScaleDownBackends(logger, lb, spec); err != nil {
+		return err
+	}
+
 	if err := lbProvider.updateLoadBalancerBackends(ctx, lb, spec); err != nil {
 		errorType = util.GetError(err)
 		lbMetricDimension = util.GetMetricDimensionForComponent(errorType, util.LoadBalancerType)
@@ -1569,6 +1577,18 @@ func (cp *CloudProvider) UpdateLoadBalancer(ctx context.Context, clusterName str
 	dimensionsMap[metrics.ComponentDimension] = lbMetricDimension
 	dimensionsMap[metrics.BackendSetsCountDimension] = strconv.Itoa(len(lb.BackendSets))
 	metrics.SendMetricData(cp.metricPusher, getMetric(loadBalancerType, Update), syncTime, dimensionsMap)
+	return nil
+}
+
+func (cp *CloudProvider) drainScaleDownBackends(logger *zap.SugaredLogger, lb *client.GenericLoadBalancer, spec *LBSpec) error {
+	if !spec.DrainBackendsOnScaleDown {
+		return nil
+	}
+	nodes, err := cp.NodeLister.List(labels.Everything())
+	if err != nil {
+		return errors.Wrap(err, "listing nodes to drain scale-down backends")
+	}
+	drainScaleDownBackends(logger, lb.BackendSets, spec.BackendSets, nodesByBackendIP(nodes))
 	return nil
 }
 

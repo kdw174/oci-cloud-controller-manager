@@ -138,6 +138,10 @@ const (
 	// See: https://docs.cloud.oracle.com/iaas/Content/Balance/Concepts/balanceoverview.htm#concepts
 	ServiceAnnotationLoadBalancerBEProtocol = "service.beta.kubernetes.io/oci-load-balancer-backend-protocol"
 
+	// ServiceAnnotationLoadBalancerDrainBackendsOnScaleDown is a Service annotation for
+	// draining, instead of removing, the backend of a node being removed by the cluster autoscaler.
+	ServiceAnnotationLoadBalancerDrainBackendsOnScaleDown = "service.beta.kubernetes.io/oci-load-balancer-drain-backends-on-scale-down"
+
 	// ServiceAnnotationLoadBalancerNetworkSecurityGroups is a service annotation for
 	// specifying Network security group Ids for the Loadbalancer
 	ServiceAnnotationLoadBalancerNetworkSecurityGroups = "oci.oraclecloud.com/oci-network-security-groups"
@@ -220,6 +224,10 @@ const (
 	// ServiceAnnotationNetworkLoadBalancerBackendPolicy is a Service annotation for
 	// The network load balancer policy for the backend set.
 	ServiceAnnotationNetworkLoadBalancerBackendPolicy = "oci-network-load-balancer.oraclecloud.com/backend-policy"
+
+	// ServiceAnnotationNetworkLoadBalancerDrainBackendsOnScaleDown is a Service annotation for
+	// draining, instead of removing, the backend of a node being removed by the cluster autoscaler.
+	ServiceAnnotationNetworkLoadBalancerDrainBackendsOnScaleDown = "oci-network-load-balancer.oraclecloud.com/drain-backends-on-scale-down"
 
 	// ServiceAnnotationNetworkLoadBalancerSecurityListManagementMode is a Service annotation for
 	// specifying the security list management mode ("All", "Frontend", "None") that configures how security lists are managed by the CCM
@@ -381,6 +389,7 @@ type LBSpec struct {
 	RuleSets                    map[string]loadbalancer.RuleSetDetails
 	AssignedPrivateIpv4         *string
 	AssignedIpv6                *string
+	DrainBackendsOnScaleDown    bool
 
 	service *v1.Service
 	nodes   []*v1.Node
@@ -487,6 +496,11 @@ func NewLBSpec(logger *zap.SugaredLogger, svc *v1.Service, provisionedNodes []*v
 		return nil, err
 	}
 
+	drainBackendsOnScaleDown, err := getDrainBackendsOnScaleDown(svc)
+	if err != nil {
+		return nil, err
+	}
+
 	return &LBSpec{
 		Type:                        lbType,
 		Name:                        GetLoadBalancerName(svc),
@@ -516,7 +530,24 @@ func NewLBSpec(logger *zap.SugaredLogger, svc *v1.Service, provisionedNodes []*v
 		RuleSets:                    ruleSets,
 		AssignedPrivateIpv4:         assignedPrivateIpv4,
 		AssignedIpv6:                assignedIpv6,
+		DrainBackendsOnScaleDown:    drainBackendsOnScaleDown,
 	}, nil
+}
+
+func getDrainBackendsOnScaleDown(svc *v1.Service) (bool, error) {
+	annotation := ServiceAnnotationLoadBalancerDrainBackendsOnScaleDown
+	if getLoadBalancerType(svc) == NLB {
+		annotation = ServiceAnnotationNetworkLoadBalancerDrainBackendsOnScaleDown
+	}
+	value, ok := svc.Annotations[annotation]
+	if !ok {
+		return false, nil
+	}
+	drain, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, errors.Wrap(err, fmt.Sprintf("invalid value: %s provided for annotation: %s", value, annotation))
+	}
+	return drain, nil
 }
 
 func getLoadBalancerCompartment(svc *v1.Service, clusterCompartment string) (compartment string) {
