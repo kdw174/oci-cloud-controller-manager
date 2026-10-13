@@ -20,6 +20,7 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	api "k8s.io/api/core/v1"
@@ -2968,4 +2969,87 @@ func Test_convertK8sIpFamiliesToOciIpVersion(t *testing.T) {
 			assert.Equalf(t, tt.want, convertK8sIpFamiliesToOciIpVersion(tt.args.ipFamily), "convertK8sIpFamiliesToOciIpVersion(%v)", tt.args.ipFamily)
 		})
 	}
+}
+
+func TestKeepRemovedBackendsDraining(t *testing.T) {
+	const lbID = "ocid1.networkloadbalancer.oc1..test"
+	const bsName = "TCP-443"
+	timeout := 60 * time.Second
+	start := time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC)
+
+	backend := func(ip string, drain *bool) client.GenericBackend {
+		return client.GenericBackend{IpAddress: common.String(ip), Port: common.Int(30443), Weight: common.Int(1), Drain: drain}
+	}
+	backendSet := func(backends ...client.GenericBackend) map[string]client.GenericBackendSetDetails {
+		return map[string]client.GenericBackendSetDetails{bsName: {Name: common.String(bsName), Policy: common.String("FIVE_TUPLE"), Backends: backends}}
+	}
+	drainByIP := func(bs map[string]client.GenericBackendSetDetails) map[string]*bool {
+		got := map[string]*bool{}
+		for _, b := range bs[bsName].Backends {
+			got[*b.IpAddress] = b.Drain
+		}
+		return got
+	}
+
+	t.Run("disabled removes backend immediately", func(t *testing.T) {
+		tracker := &backendDrainTracker{starts: map[string]map[string]time.Time{}}
+		actual := backendSet(backend("10.0.0.1", nil), backend("10.0.0.2", nil))
+		desired := backendSet(backend("10.0.0.1", nil))
+
+		requeue := tracker.keepRemovedBackendsDraining(lbID, actual, desired, 0, start)
+
+		assert.Zero(t, requeue)
+		assert.Equal(t, map[string]*bool{"10.0.0.1": nil}, drainByIP(desired))
+		assert.True(t, hasBackendSetChanged(zap.S(), actual[bsName], desired[bsName]))
+		assert.Empty(t, tracker.starts)
+	})
+
+	t.Run("disabled ignores drain state on existing backends", func(t *testing.T) {
+		tracker := &backendDrainTracker{starts: map[string]map[string]time.Time{}}
+		actual := backendSet(backend("10.0.0.1", common.Bool(true)))
+		desired := backendSet(backend("10.0.0.1", nil))
+
+		tracker.keepRemovedBackendsDraining(lbID, actual, desired, 0, start)
+
+		assert.False(t, hasBackendSetChanged(zap.S(), actual[bsName], desired[bsName]))
+	})
+
+	t.Run("removed backend drains until timeout then is removed", func(t *testing.T) {
+		tracker := &backendDrainTracker{starts: map[string]map[string]time.Time{}}
+
+		actual := backendSet(backend("10.0.0.1", common.Bool(false)), backend("10.0.0.2", common.Bool(false)))
+		desired := backendSet(backend("10.0.0.1", nil))
+		requeue := tracker.keepRemovedBackendsDraining(lbID, actual, desired, timeout, start)
+		assert.Equal(t, timeout, requeue)
+		assert.Equal(t, map[string]*bool{"10.0.0.1": common.Bool(false), "10.0.0.2": common.Bool(true)}, drainByIP(desired))
+		assert.True(t, hasBackendSetChanged(zap.S(), actual[bsName], desired[bsName]))
+
+		actual = backendSet(backend("10.0.0.1", common.Bool(false)), backend("10.0.0.2", common.Bool(true)))
+		desired = backendSet(backend("10.0.0.1", nil))
+		requeue = tracker.keepRemovedBackendsDraining(lbID, actual, desired, timeout, start.Add(20*time.Second))
+		assert.Equal(t, 40*time.Second, requeue)
+		assert.False(t, hasBackendSetChanged(zap.S(), actual[bsName], desired[bsName]))
+
+		desired = backendSet(backend("10.0.0.1", nil))
+		requeue = tracker.keepRemovedBackendsDraining(lbID, actual, desired, timeout, start.Add(timeout))
+		assert.Zero(t, requeue)
+		assert.Equal(t, map[string]*bool{"10.0.0.1": common.Bool(false)}, drainByIP(desired))
+		assert.True(t, hasBackendSetChanged(zap.S(), actual[bsName], desired[bsName]))
+		assert.Empty(t, tracker.starts)
+	})
+
+	t.Run("re-added backend is undrained", func(t *testing.T) {
+		tracker := &backendDrainTracker{starts: map[string]map[string]time.Time{}}
+		actual := backendSet(backend("10.0.0.1", common.Bool(false)), backend("10.0.0.2", common.Bool(false)))
+		tracker.keepRemovedBackendsDraining(lbID, actual, backendSet(backend("10.0.0.1", nil)), timeout, start)
+
+		actual = backendSet(backend("10.0.0.1", common.Bool(false)), backend("10.0.0.2", common.Bool(true)))
+		desired := backendSet(backend("10.0.0.1", nil), backend("10.0.0.2", nil))
+		requeue := tracker.keepRemovedBackendsDraining(lbID, actual, desired, timeout, start.Add(10*time.Second))
+
+		assert.Zero(t, requeue)
+		assert.Equal(t, map[string]*bool{"10.0.0.1": common.Bool(false), "10.0.0.2": common.Bool(false)}, drainByIP(desired))
+		assert.True(t, hasBackendSetChanged(zap.S(), actual[bsName], desired[bsName]))
+		assert.Empty(t, tracker.starts)
+	})
 }

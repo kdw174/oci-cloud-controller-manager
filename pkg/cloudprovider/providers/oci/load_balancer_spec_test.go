@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/loadbalancer"
 	"github.com/pkg/errors"
@@ -12294,6 +12295,58 @@ func TestIsSkipPrivateIP_NLB(t *testing.T) {
 			}
 			if got != tt.expected {
 				t.Errorf("isSkipPrivateIP() = %v, expected %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func Test_getBackendDrainTimeout(t *testing.T) {
+	testCases := map[string]struct {
+		annotations map[string]string
+		expected    time.Duration
+		wantErr     bool
+	}{
+		"LB unset": {
+			annotations: map[string]string{},
+		},
+		"LB set": {
+			annotations: map[string]string{ServiceAnnotationLoadBalancerBackendDrainTimeout: "30"},
+			expected:    30 * time.Second,
+		},
+		"NLB set": {
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerType:                       "nlb",
+				ServiceAnnotationNetworkLoadBalancerBackendDrainTimeout: "60",
+			},
+			expected: 60 * time.Second,
+		},
+		"NLB ignores LB annotation": {
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerType:                "nlb",
+				ServiceAnnotationLoadBalancerBackendDrainTimeout: "60",
+			},
+		},
+		"not a number": {
+			annotations: map[string]string{ServiceAnnotationLoadBalancerBackendDrainTimeout: "60s"},
+			wantErr:     true,
+		},
+		"negative": {
+			annotations: map[string]string{
+				ServiceAnnotationLoadBalancerType:                       "nlb",
+				ServiceAnnotationNetworkLoadBalancerBackendDrainTimeout: "-1",
+			},
+			wantErr: true,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: tc.annotations}}
+			got, err := getBackendDrainTimeout(svc)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("getBackendDrainTimeout() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.expected {
+				t.Errorf("getBackendDrainTimeout() = %v, expected %v", got, tc.expected)
 			}
 		})
 	}

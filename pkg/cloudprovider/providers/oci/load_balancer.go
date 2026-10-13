@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	k8sports "k8s.io/kubernetes/pkg/cluster/ports"
 	"k8s.io/utils/net"
 	"k8s.io/utils/pointer"
@@ -906,6 +907,8 @@ func (cp *CloudProvider) EnsureLoadBalancer(ctx context.Context, clusterName str
 		return nil, nil
 	}
 
+	drainRequeueAfter := backendDrains.keepRemovedBackendsDraining(*lb.Id, lb.BackendSets, spec.BackendSets, spec.BackendDrainTimeout, time.Now())
+
 	if err := lbProvider.updateLoadBalancer(ctx, lb, spec); err != nil {
 		errorType = util.GetError(err)
 		lbMetricDimension = util.GetMetricDimensionForComponent(errorType, util.LoadBalancerType)
@@ -922,11 +925,19 @@ func (cp *CloudProvider) EnsureLoadBalancer(ctx context.Context, clusterName str
 	dimensionsMap[metrics.BackendSetsCountDimension] = strconv.Itoa(len(lb.BackendSets))
 	metrics.SendMetricData(cp.metricPusher, getMetric(loadBalancerType, Update), syncTime, dimensionsMap)
 
+	if drainRequeueAfter > 0 {
+		return nil, backendsDrainingError(drainRequeueAfter)
+	}
+
 	skipPrivateIP, err := isSkipPrivateIP(service)
 	if err != nil {
 		return nil, err
 	}
 	return loadBalancerToStatus(lb, spec.ingressIpMode, skipPrivateIP, logger)
+}
+
+func backendsDrainingError(requeueAfter time.Duration) error {
+	return cloudproviderapi.NewRetryError(fmt.Sprintf("backends are draining, next removal in %s", requeueAfter), requeueAfter)
 }
 
 func getDefaultLBSubnets(subnet1, subnet2 string) []string {
@@ -1554,6 +1565,8 @@ func (cp *CloudProvider) UpdateLoadBalancer(ctx context.Context, clusterName str
 		return err
 	}
 
+	drainRequeueAfter := backendDrains.keepRemovedBackendsDraining(lbOCID, lb.BackendSets, spec.BackendSets, spec.BackendDrainTimeout, time.Now())
+
 	if err := lbProvider.updateLoadBalancerBackends(ctx, lb, spec); err != nil {
 		errorType = util.GetError(err)
 		lbMetricDimension = util.GetMetricDimensionForComponent(errorType, util.LoadBalancerType)
@@ -1569,6 +1582,9 @@ func (cp *CloudProvider) UpdateLoadBalancer(ctx context.Context, clusterName str
 	dimensionsMap[metrics.ComponentDimension] = lbMetricDimension
 	dimensionsMap[metrics.BackendSetsCountDimension] = strconv.Itoa(len(lb.BackendSets))
 	metrics.SendMetricData(cp.metricPusher, getMetric(loadBalancerType, Update), syncTime, dimensionsMap)
+	if drainRequeueAfter > 0 {
+		return backendsDrainingError(drainRequeueAfter)
+	}
 	return nil
 }
 

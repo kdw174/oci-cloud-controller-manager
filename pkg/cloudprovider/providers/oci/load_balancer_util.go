@@ -23,10 +23,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/pointer"
 
 	"github.com/oracle/oci-cloud-controller-manager/pkg/metrics"
 	"github.com/oracle/oci-cloud-controller-manager/pkg/oci/client"
@@ -276,18 +279,21 @@ func hasBackendSetChanged(logger *zap.SugaredLogger, actual client.GenericBacken
 	backendSetChanges = append(backendSetChanges, getSSLConfigurationChanges(actual.SslConfiguration, desired.SslConfiguration)...)
 	nameFormat := "%s:%d"
 
-	desiredSet := sets.NewString()
+	desiredDrain := make(map[string]*bool, len(desired.Backends))
 	for _, backend := range desired.Backends {
 		name := fmt.Sprintf(nameFormat, *backend.IpAddress, *backend.Port)
-		desiredSet.Insert(name)
+		desiredDrain[name] = backend.Drain
 	}
 
 	actualSet := sets.NewString()
 	var backendChanges []string
 	for _, backend := range actual.Backends {
 		name := fmt.Sprintf(nameFormat, *backend.IpAddress, *backend.Port)
-		if !desiredSet.Has(name) {
+		drain, ok := desiredDrain[name]
+		if !ok {
 			backendChanges = append(backendChanges, fmt.Sprintf(backendChangeFmtStr, "BackEndSet:Backend Remove", name))
+		} else if drain != nil && *drain != toBool(backend.Drain) {
+			backendChanges = append(backendChanges, fmt.Sprintf(changeFmtStr, "BackEndSet:Backend "+name+" Drain", toBool(backend.Drain), *drain))
 		}
 		actualSet.Insert(name)
 	}
@@ -308,6 +314,71 @@ func hasBackendSetChanged(logger *zap.SugaredLogger, actual client.GenericBacken
 		return true
 	}
 	return false
+}
+
+type backendDrainTracker struct {
+	mu sync.Mutex
+	// load balancer ID -> "<backend set>/<ip>:<port>" -> time the backend started draining
+	starts map[string]map[string]time.Time
+}
+
+var backendDrains = &backendDrainTracker{starts: map[string]map[string]time.Time{}}
+
+// keepRemovedBackendsDraining adds backends whose IP is no longer in a desired
+// backend set back to it with Drain set, until timeout has passed since they
+// started draining. It returns how long until the next draining backend is due
+// for removal, or 0 if none are draining.
+func (t *backendDrainTracker) keepRemovedBackendsDraining(lbID string, actual, desired map[string]client.GenericBackendSetDetails, timeout time.Duration, now time.Time) time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	previous := t.starts[lbID]
+	delete(t.starts, lbID)
+	if timeout <= 0 {
+		return 0
+	}
+
+	current := map[string]time.Time{}
+	var requeueAfter time.Duration
+	for name, desiredBackendSet := range desired {
+		actualBackendSet, ok := actual[name]
+		if !ok {
+			continue
+		}
+		desiredIPs := sets.NewString()
+		backends := make([]client.GenericBackend, 0, len(actualBackendSet.Backends))
+		for _, backend := range desiredBackendSet.Backends {
+			desiredIPs.Insert(*backend.IpAddress)
+			backend.Drain = pointer.Bool(false)
+			backends = append(backends, backend)
+		}
+		for _, backend := range actualBackendSet.Backends {
+			if desiredIPs.Has(*backend.IpAddress) {
+				continue
+			}
+			key := fmt.Sprintf("%s/%s:%d", name, *backend.IpAddress, *backend.Port)
+			start, ok := previous[key]
+			if !ok {
+				start = now
+			}
+			remaining := timeout - now.Sub(start)
+			if remaining <= 0 {
+				continue
+			}
+			current[key] = start
+			backend.Drain = pointer.Bool(true)
+			backends = append(backends, backend)
+			if requeueAfter == 0 || remaining < requeueAfter {
+				requeueAfter = remaining
+			}
+		}
+		desiredBackendSet.Backends = backends
+		desired[name] = desiredBackendSet
+	}
+	if len(current) > 0 {
+		t.starts[lbID] = current
+	}
+	return requeueAfter
 }
 
 func healthCheckerToDetails(hc *client.GenericHealthChecker) *client.GenericHealthChecker {

@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/oracle/oci-go-sdk/v65/loadbalancer"
 	"go.uber.org/zap"
@@ -138,6 +139,11 @@ const (
 	// See: https://docs.cloud.oracle.com/iaas/Content/Balance/Concepts/balanceoverview.htm#concepts
 	ServiceAnnotationLoadBalancerBEProtocol = "service.beta.kubernetes.io/oci-load-balancer-backend-protocol"
 
+	// ServiceAnnotationLoadBalancerBackendDrainTimeout is a Service annotation for
+	// the number of seconds a backend whose node left the service is kept draining
+	// before it is removed. Unset or 0 removes it immediately.
+	ServiceAnnotationLoadBalancerBackendDrainTimeout = "service.beta.kubernetes.io/oci-load-balancer-backend-drain-timeout"
+
 	// ServiceAnnotationLoadBalancerNetworkSecurityGroups is a service annotation for
 	// specifying Network security group Ids for the Loadbalancer
 	ServiceAnnotationLoadBalancerNetworkSecurityGroups = "oci.oraclecloud.com/oci-network-security-groups"
@@ -220,6 +226,11 @@ const (
 	// ServiceAnnotationNetworkLoadBalancerBackendPolicy is a Service annotation for
 	// The network load balancer policy for the backend set.
 	ServiceAnnotationNetworkLoadBalancerBackendPolicy = "oci-network-load-balancer.oraclecloud.com/backend-policy"
+
+	// ServiceAnnotationNetworkLoadBalancerBackendDrainTimeout is a Service annotation for
+	// the number of seconds a backend whose node left the service is kept draining
+	// before it is removed. Unset or 0 removes it immediately.
+	ServiceAnnotationNetworkLoadBalancerBackendDrainTimeout = "oci-network-load-balancer.oraclecloud.com/backend-drain-timeout"
 
 	// ServiceAnnotationNetworkLoadBalancerSecurityListManagementMode is a Service annotation for
 	// specifying the security list management mode ("All", "Frontend", "None") that configures how security lists are managed by the CCM
@@ -381,6 +392,7 @@ type LBSpec struct {
 	RuleSets                    map[string]loadbalancer.RuleSetDetails
 	AssignedPrivateIpv4         *string
 	AssignedIpv6                *string
+	BackendDrainTimeout         time.Duration
 
 	service *v1.Service
 	nodes   []*v1.Node
@@ -487,6 +499,11 @@ func NewLBSpec(logger *zap.SugaredLogger, svc *v1.Service, provisionedNodes []*v
 		return nil, err
 	}
 
+	backendDrainTimeout, err := getBackendDrainTimeout(svc)
+	if err != nil {
+		return nil, err
+	}
+
 	return &LBSpec{
 		Type:                        lbType,
 		Name:                        GetLoadBalancerName(svc),
@@ -516,7 +533,24 @@ func NewLBSpec(logger *zap.SugaredLogger, svc *v1.Service, provisionedNodes []*v
 		RuleSets:                    ruleSets,
 		AssignedPrivateIpv4:         assignedPrivateIpv4,
 		AssignedIpv6:                assignedIpv6,
+		BackendDrainTimeout:         backendDrainTimeout,
 	}, nil
+}
+
+func getBackendDrainTimeout(svc *v1.Service) (time.Duration, error) {
+	annotation := ServiceAnnotationLoadBalancerBackendDrainTimeout
+	if getLoadBalancerType(svc) == NLB {
+		annotation = ServiceAnnotationNetworkLoadBalancerBackendDrainTimeout
+	}
+	value, ok := svc.Annotations[annotation]
+	if !ok {
+		return 0, nil
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds < 0 {
+		return 0, fmt.Errorf("invalid value: %s provided for annotation: %s", value, annotation)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 func getLoadBalancerCompartment(svc *v1.Service, clusterCompartment string) (compartment string) {

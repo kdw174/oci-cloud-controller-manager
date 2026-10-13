@@ -547,6 +547,7 @@ func backendsToBackendDetails(backends []GenericBackend) []networkloadbalancer.B
 			IpAddress: backend.IpAddress,
 			TargetId:  backend.TargetId,
 			Weight:    backend.Weight,
+			IsDrain:   backend.Drain,
 		})
 
 	}
@@ -676,6 +677,7 @@ func (c *networkLoadbalancer) backendDetailsToGenericBackendDetails(details []ne
 			Port:      backends.Port,
 			Weight:    backends.Weight,
 			TargetId:  backends.TargetId,
+			Drain:     backends.IsDrain,
 		})
 	}
 	return genericBackendDetails
